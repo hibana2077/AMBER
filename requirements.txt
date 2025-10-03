@@ -1,0 +1,12 @@
+torch
+transformers
+timm
+pytorchvideo
+evaluate
+torchvision
+opencv-python
+pillow
+imageio
+imageio-ffmpeg
+matplotlib
+numpy

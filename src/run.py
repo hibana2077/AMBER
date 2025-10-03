@@ -1,0 +1,392 @@
+#!/usr/bin/env python
+"""
+AMBER video classification runner
+
+CLI for fine-tuning and evaluating a VideoMAE model on the UCF101 subset
+dataset as described in docs/video_cls.md. Uses PyTorchVideo for datasets and
+Hugging Face Transformers Trainer for training/eval.
+
+Example usage (PowerShell):
+  # Train
+  python -m src.run train --data-root UCF101_subset --output-dir runs/videomae-ucf --epochs 4 --batch-size 4
+
+  # Eval (validation)
+  python -m src.run eval --data-root UCF101_subset --model runs/videomae-ucf --split val --batch-size 4
+
+Notes:
+- This focuses on VideoMAE per the docs provided. You can switch to a different
+  VideoMAE checkpoint via --model-id.
+- The dataset layout is assumed to follow the UCF101 subset structure from docs/video_cls.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+try:
+    import pytorchvideo.data
+    from pytorchvideo.transforms import (
+        ApplyTransformToKey,
+        Normalize,
+        RandomShortSideScale,
+        RemoveKey,
+        ShortSideScale,
+        UniformTemporalSubsample,
+    )
+    from torchvision.transforms import Compose, Lambda, RandomCrop, RandomHorizontalFlip, Resize
+except Exception as e:  # pragma: no cover
+    raise SystemExit(
+        "This script requires pytorchvideo and torchvision. Install requirements (see requirements.txt) and try again.\n"
+        + str(e)
+    )
+
+from transformers import (
+    AutoModelForVideoClassification,
+    AutoImageProcessor,
+    AutoVideoProcessor,
+    TrainingArguments,
+    Trainer,
+)
+
+try:
+    import evaluate  # type: ignore
+except Exception:
+    evaluate = None
+
+
+# -----------------------------
+# Data / transforms
+# -----------------------------
+
+
+def build_label_maps(data_root: str) -> Tuple[Dict[str, int], Dict[int, str]]:
+    """Scan class folders to build label mappings.
+
+    Expects structure:
+      data_root/{train,val,test}/<CLASS_NAME>/*.avi|*.mp4
+    """
+    import pathlib
+
+    root = pathlib.Path(data_root)
+    class_dirs = set()
+    for split in ("train", "val", "test"):
+        split_dir = root / split
+        if split_dir.exists():
+            for p in split_dir.glob("*"):
+                if p.is_dir():
+                    class_dirs.add(p.name)
+    class_labels = sorted(class_dirs)
+    if not class_labels:
+        raise FileNotFoundError(
+            f"No class folders found under {data_root}. Expected UCF101-like structure with train/val/test."
+        )
+    label2id = {label: i for i, label in enumerate(class_labels)}
+    id2label = {i: label for label, i in label2id.items()}
+    return label2id, id2label
+
+
+def _get_num_frames_from_config(cfg: Any, default: int = 16) -> int:
+    # Support various configs: VideoMAE/ViViT/TimeSformer use `num_frames`; V-JEPA2 uses `frames_per_clip`.
+    for key in ("num_frames", "frames_per_clip"):
+        if hasattr(cfg, key) and getattr(cfg, key):
+            return int(getattr(cfg, key))
+    return default
+
+
+def build_transforms(processor: Any, model: Any):
+    # Processor could be AutoImageProcessor/AutoVideoProcessor specific instance
+    mean = getattr(processor, "image_mean", [0.485, 0.456, 0.406])
+    std = getattr(processor, "image_std", [0.229, 0.224, 0.225])
+
+    size = getattr(processor, "size", {}) or {}
+    if isinstance(size, int):
+        height = width = size
+    elif "shortest_edge" in size:
+        height = width = size["shortest_edge"]
+    else:
+        height = size.get("height", 224)
+        width = size.get("width", 224)
+    resize_to = (height, width)
+
+    num_frames_to_sample = _get_num_frames_from_config(model.config, 16)
+    sample_rate = 4
+    fps = 30
+    clip_duration = num_frames_to_sample * sample_rate / fps
+
+    train_transform = Compose(
+        [
+            ApplyTransformToKey(
+                key="video",
+                transform=Compose(
+                    [
+                        UniformTemporalSubsample(num_frames_to_sample),
+                        Lambda(lambda x: x / 255.0),
+                        Normalize(mean, std),
+                        RandomShortSideScale(min_size=256, max_size=320),
+                        RandomCrop(resize_to),
+                        RandomHorizontalFlip(p=0.5),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    eval_transform = Compose(
+        [
+            ApplyTransformToKey(
+                key="video",
+                transform=Compose(
+                    [
+                        UniformTemporalSubsample(num_frames_to_sample),
+                        Lambda(lambda x: x / 255.0),
+                        Normalize(mean, std),
+                        Resize(resize_to),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    return train_transform, eval_transform, clip_duration
+
+
+def build_datasets(
+    data_root: str,
+    processor: Any,
+    model: Any,
+):
+    train_t, eval_t, clip_duration = build_transforms(processor, model)
+
+    def make(split: str, transform):
+        split_path = os.path.join(data_root, split)
+        if not os.path.isdir(split_path):
+            return None
+        return pytorchvideo.data.Ucf101(
+            data_path=split_path,
+            clip_sampler=pytorchvideo.data.make_clip_sampler(
+                "random" if split == "train" else "uniform", clip_duration
+            ),
+            decode_audio=False,
+            transform=transform,
+        )
+
+    return make("train", train_t), make("val", eval_t), make("test", eval_t)
+
+
+def collate_fn(examples):
+    # permute to (num_frames, num_channels, height, width)
+    pixel_values = torch.stack([example["video"].permute(1, 0, 2, 3) for example in examples])
+    labels = torch.tensor([int(example["label"]) for example in examples])
+    return {"pixel_values": pixel_values, "labels": labels}
+
+
+# -----------------------------
+# Metrics
+# -----------------------------
+
+
+def build_metrics():
+    if evaluate is None:
+        # Fallback simple accuracy implementation if evaluate is not installed
+        def _compute_metrics(eval_pred):
+            logits = eval_pred.predictions
+            labels = eval_pred.label_ids
+            preds = np.argmax(logits, axis=1)
+            acc = float((preds == labels).mean())
+            return {"accuracy": acc}
+
+        return _compute_metrics
+
+    metric = evaluate.load("accuracy")
+
+    def compute_metrics(eval_pred):
+        predictions = np.argmax(eval_pred.predictions, axis=1)
+        return metric.compute(predictions=predictions, references=eval_pred.label_ids)
+
+    return compute_metrics
+
+
+# -----------------------------
+# Train / Eval entrypoints
+# -----------------------------
+
+
+def do_train(args: argparse.Namespace):
+    label2id, id2label = build_label_maps(args.data_root)
+
+    # Load a compatible processor (try AutoVideoProcessor first, then AutoImageProcessor)
+    try:
+        processor = AutoVideoProcessor.from_pretrained(args.model_id)
+    except Exception:
+        processor = AutoImageProcessor.from_pretrained(args.model_id)
+
+    model = AutoModelForVideoClassification.from_pretrained(
+        args.model_id,
+        label2id=label2id,
+        id2label=id2label,
+        ignore_mismatched_sizes=True,
+    )
+
+    train_ds, val_ds, test_ds = build_datasets(args.data_root, processor, model)
+    if train_ds is None:
+        raise ValueError("Training split not found. Ensure data_root/train exists.")
+
+    metric_fn = build_metrics()
+
+    # Some datasets from pytorchvideo don't implement __len__, set max_steps accordingly
+    max_steps = None
+    if args.epochs is None:
+        # Use steps if epochs not set: assume 300 videos by default like docs example
+        if hasattr(train_ds, "num_videos") and train_ds.num_videos:
+            train_videos = train_ds.num_videos
+        else:
+            train_videos = 300  # heuristic fallback
+        steps_per_epoch = max(1, train_videos // max(1, args.batch_size))
+        max_steps = steps_per_epoch * 4  # 4 epochs default
+
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        remove_unused_columns=False,
+        evaluation_strategy="epoch" if val_ds is not None else "no",
+        save_strategy="epoch" if val_ds is not None else "no",
+        learning_rate=args.lr,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        warmup_ratio=0.1,
+        logging_steps=10,
+        load_best_model_at_end=bool(val_ds is not None),
+        metric_for_best_model="accuracy",
+        num_train_epochs=args.epochs if args.epochs is not None else 1,
+        max_steps=max_steps,
+        fp16=args.fp16,
+        dataloader_num_workers=args.num_workers,
+        report_to=["none"],
+    )
+
+    trainer = Trainer(
+        model,
+        training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        processing_class=processor,
+        compute_metrics=metric_fn,
+        data_collator=collate_fn,
+    )
+
+    train_result = trainer.train()
+    trainer.save_model()  # saves to output_dir
+
+    metrics = {"train_runtime": float(train_result.metrics.get("train_runtime", 0))}
+    if val_ds is not None:
+        eval_metrics = trainer.evaluate()
+        metrics.update({f"val_{k}": v for k, v in eval_metrics.items()})
+
+    # Optional test evaluation
+    if args.eval_test and test_ds is not None:
+        test_metrics = trainer.evaluate(test_ds)
+        metrics.update({f"test_{k}": v for k, v in test_metrics.items()})
+
+    # Print final summary
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+
+
+def do_eval(args: argparse.Namespace):
+    label2id, id2label = build_label_maps(args.data_root)
+    # Load processor and model automatically for eval
+    model_path = args.model if args.model else args.model_id
+    try:
+        processor = AutoVideoProcessor.from_pretrained(model_path)
+    except Exception:
+        processor = AutoImageProcessor.from_pretrained(model_path)
+    model = AutoModelForVideoClassification.from_pretrained(model_path)
+
+    # Ensure label maps align if possible
+    if set(model.config.id2label.values()) != set(id2label.values()):
+        print("Warning: Model labels differ from dataset labels. Proceeding with model's label set.")
+
+    _, val_ds, test_ds = build_datasets(args.data_root, processor, model)
+    if args.split == "val" and val_ds is None:
+        raise ValueError("Validation split not found.")
+    if args.split == "test" and test_ds is None:
+        raise ValueError("Test split not found.")
+
+    eval_ds = val_ds if args.split == "val" else test_ds
+
+    metric_fn = build_metrics()
+
+    training_args = TrainingArguments(
+        output_dir=os.path.join(args.output_dir, "eval"),
+        per_device_eval_batch_size=args.batch_size,
+        dataloader_num_workers=args.num_workers,
+        report_to=["none"],
+    )
+
+    trainer = Trainer(
+        model,
+        training_args,
+        train_dataset=None,
+        eval_dataset=eval_ds,
+        processing_class=processor,
+        compute_metrics=metric_fn,
+        data_collator=collate_fn,
+    )
+
+    metrics = trainer.evaluate()
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="AMBER: Video classification train/eval runner (VideoMAE)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # Train
+    p_train = sub.add_parser("train", help="Fine-tune VideoMAE on UCF101 subset")
+    p_train.add_argument("--data-root", type=str, required=True, help="Root folder of dataset (train/val/test)")
+    p_train.add_argument("--model-id", type=str, default="MCG-NJU/videomae-base", help="Pretrained model id/path")
+    p_train.add_argument("--output-dir", type=str, default="runs/videomae-ucf")
+    p_train.add_argument("--batch-size", type=int, default=4)
+    p_train.add_argument("--epochs", type=int, default=4)
+    p_train.add_argument("--lr", type=float, default=5e-5)
+    p_train.add_argument("--num-workers", type=int, default=4)
+    p_train.add_argument("--fp16", action="store_true")
+    p_train.add_argument("--eval-test", action="store_true", help="Also evaluate on test split after training")
+
+    # Eval
+    p_eval = sub.add_parser("eval", help="Evaluate a fine-tuned model on val/test")
+    p_eval.add_argument("--data-root", type=str, required=True)
+    p_eval.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to fine-tuned model dir or HF repo id; if omitted, uses --model-id",
+    )
+    p_eval.add_argument("--model-id", type=str, default="MCG-NJU/videomae-base")
+    p_eval.add_argument("--split", type=str, choices=["val", "test"], default="val")
+    p_eval.add_argument("--batch-size", type=int, default=4)
+    p_eval.add_argument("--num-workers", type=int, default=4)
+    p_eval.add_argument("--output-dir", type=str, default="runs/videomae-ucf")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.cmd == "train":
+        do_train(args)
+    elif args.cmd == "eval":
+        do_eval(args)
+    else:  # pragma: no cover
+        raise SystemExit(f"Unknown subcommand: {args.cmd}")
+
+
+if __name__ == "__main__":
+    main()
