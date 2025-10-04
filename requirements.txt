@@ -10,3 +10,4 @@ imageio
 imageio-ffmpeg
 matplotlib
 numpy
+tqdm
