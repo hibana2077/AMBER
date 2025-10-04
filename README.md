@@ -1,4 +1,4 @@
-# AMBER
+# AMBER: Attribution-based Motion–Background Evidence Ratio for Faithful Spatiotemporal Explanations of Video Models 
 
 Utilities for video classification experiments using Hugging Face Transformers.
 
