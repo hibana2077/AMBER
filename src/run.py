@@ -193,22 +193,75 @@ def collate_fn(examples):
 
 
 def build_metrics():
+    """Return a metrics function for Hugging Face Trainer.
+
+    Adds accuracy, macro precision, macro recall, macro F1.
+    Falls back to a pure NumPy implementation if `evaluate` is not available.
+    """
+
     if evaluate is None:
-        # Fallback simple accuracy implementation if evaluate is not installed
+        # Fallback implementation (no external dependencies beyond numpy)
         def _compute_metrics(eval_pred):
             logits = eval_pred.predictions
             labels = eval_pred.label_ids
             preds = np.argmax(logits, axis=1)
+
+            # Accuracy
             acc = float((preds == labels).mean())
-            return {"accuracy": acc}
+
+            # Per-class stats for macro metrics
+            unique_labels = np.unique(labels)
+            precisions = []
+            recalls = []
+            f1s = []
+            for c in unique_labels:
+                tp = float(np.sum((preds == c) & (labels == c)))
+                fp = float(np.sum((preds == c) & (labels != c)))
+                fn = float(np.sum((preds != c) & (labels == c)))
+                precision_c = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                recall_c = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                if precision_c + recall_c > 0:
+                    f1_c = 2 * precision_c * recall_c / (precision_c + recall_c)
+                else:
+                    f1_c = 0.0
+                precisions.append(precision_c)
+                recalls.append(recall_c)
+                f1s.append(f1_c)
+
+            precision_macro = float(np.mean(precisions)) if precisions else 0.0
+            recall_macro = float(np.mean(recalls)) if recalls else 0.0
+            f1_macro = float(np.mean(f1s)) if f1s else 0.0
+
+            return {
+                "accuracy": acc,
+                "precision_macro": precision_macro,
+                "recall_macro": recall_macro,
+                "f1_macro": f1_macro,
+            }
 
         return _compute_metrics
 
-    metric = evaluate.load("accuracy")
+    # Use evaluate for richer metrics
+    accuracy_metric = evaluate.load("accuracy")
+    precision_metric = evaluate.load("precision")
+    recall_metric = evaluate.load("recall")
+    f1_metric = evaluate.load("f1")
 
     def compute_metrics(eval_pred):
-        predictions = np.argmax(eval_pred.predictions, axis=1)
-        return metric.compute(predictions=predictions, references=eval_pred.label_ids)
+        preds = np.argmax(eval_pred.predictions, axis=1)
+        labels = eval_pred.label_ids
+        acc = accuracy_metric.compute(predictions=preds, references=labels)["accuracy"]
+        precision = precision_metric.compute(predictions=preds, references=labels, average="macro")[
+            "precision"
+        ]
+        recall = recall_metric.compute(predictions=preds, references=labels, average="macro")["recall"]
+        f1 = f1_metric.compute(predictions=preds, references=labels, average="macro")["f1"]
+        return {
+            "accuracy": acc,
+            "precision_macro": precision,
+            "recall_macro": recall,
+            "f1_macro": f1,
+        }
 
     return compute_metrics
 
