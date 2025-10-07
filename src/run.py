@@ -222,10 +222,32 @@ def collate_fn(examples):
             c_thw = v
         vids.append(c_thw)
 
-    # Verify uniform temporal length (after subsample transform they should match)
-    t_lens = {v.shape[1] for v in vids}
-    if len(t_lens) != 1:
-        raise RuntimeError(f"Inconsistent num frames in batch after transforms: {sorted(t_lens)}")
+    # Verify uniform temporal length; if inconsistent, perform a robust fallback
+    # uniform temporal resampling to the MIN length (to avoid padding / extra memory).
+    t_lens_list = [v.shape[1] for v in vids]
+    unique_t = sorted(set(t_lens_list))
+    if len(unique_t) != 1:
+        # Fallback path: uniformly sample each video to target_len
+        target_len = min(unique_t)
+        # We log only once per batch (stderr) to avoid noisy output; import locally.
+        import sys
+        print(
+            f"[collate_fn warning] Inconsistent frame counts {unique_t}; resampling all to {target_len} frames.",
+            file=sys.stderr,
+        )
+        new_vids = []
+        for v in vids:
+            T = v.shape[1]
+            if T == target_len:
+                new_vids.append(v)
+            else:
+                # Uniform index selection over existing frames
+                if target_len == 1:
+                    idx = torch.tensor([T // 2])
+                else:
+                    idx = torch.linspace(0, T - 1, target_len).long()
+                new_vids.append(v[:, idx])
+        vids = new_vids
 
     batch = torch.stack(vids)  # (B,C,T,H,W)
     pixel_values = batch.permute(0,2,1,3,4)  # -> (B,T,C,H,W)
