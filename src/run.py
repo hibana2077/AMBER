@@ -83,6 +83,7 @@ def build_label_maps(data_root: str) -> Tuple[Dict[str, int], Dict[int, str]]:
     class_dirs = set()
     for split in ("train", "val", "test"):
         split_dir = root / split
+        print(f"Scanning {split_dir}...")
         if split_dir.exists():
             for p in split_dir.glob("*"):
                 if p.is_dir():
