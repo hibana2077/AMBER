@@ -9,7 +9,7 @@
 #PBS -l storage=scratch/rp06
 
 module load cuda/12.6.2
-source /scratch/rp06/sl5952/Mica/.venv/bin/activate
+source /scratch/rp06/sl5952/AMBER/.venv/bin/activate
 export HF_HOME="/scratch/rp06/sl5952/AMBER/.cache"
 
 cd ../..
