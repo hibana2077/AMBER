@@ -82,7 +82,11 @@ def build_label_maps(data_root: str) -> Tuple[Dict[str, int], Dict[int, str]]:
     root = pathlib.Path(data_root)
     class_dirs = set()
     for split in ("train", "val", "test"):
-        split_dir = root / split
+        # split_dir = root / split
+        # Scanning .\datasets\ucf101_subset\temp_download\extracted\UCF101_subset/train...
+        # Scanning .\datasets\ucf101_subset\temp_download\extracted\UCF101_subset/val...
+        # Scanning .\datasets\ucf101_subset\temp_download\extracted\UCF101_subset/test...
+        split_dir = f"{root}\{split}"
         print(f"Scanning {split_dir}...")
         if split_dir.exists():
             for p in split_dir.glob("*"):
