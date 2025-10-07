@@ -76,6 +76,12 @@ os.environ["TRANSFORMERS_CACHE"] = os.path.join(cache_path, "transformers")
 os.environ["HF_DATASETS_CACHE"] = os.path.join(cache_path, "datasets")
 os.environ["HF_METRICS_CACHE"] = os.path.join(cache_path, "metrics")
 os.environ["HF_MODULES_CACHE"] = os.path.join(cache_path, "modules")
+print(f"HF_HOME: {os.getenv('HF_HOME')}")
+print(f"HF_HUB_CACHE: {os.getenv('HF_HUB_CACHE')}")
+print(f"TRANSFORMERS_CACHE: {os.getenv('TRANSFORMERS_CACHE')}")
+print(f"HF_DATASETS_CACHE: {os.getenv('HF_DATASETS_CACHE')}")
+print(f"HF_METRICS_CACHE: {os.getenv('HF_METRICS_CACHE')}")
+print(f"HF_MODULES_CACHE: {os.getenv('HF_MODULES_CACHE')}")
 
 # -----------------------------
 # Data / transforms
