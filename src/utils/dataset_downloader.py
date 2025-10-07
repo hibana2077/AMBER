@@ -30,7 +30,7 @@ DATASETS = {
     "ucf101_subset": {
         "name": "UCF101 Subset (10 classes)",
         "description": "A subset of UCF101 with 10 action classes for quick experiments",
-        "url": "https://www.crcv.ucf.edu/data/UCF101/UCF101.rar",
+        "url": "https://huggingface.co/datasets/sayakpaul/ucf101-subset/resolve/main/UCF101_subset.tar.gz?download=true",
         "type": "ucf101",
         "classes": [
             "ApplyEyeMakeup", "BasketballDunk", "BenchPress", "Biking", "Billiards",
