@@ -83,50 +83,109 @@ class DownloadProgressBar:
                 self.pbar.close()
 
 
+def _looks_like_html(file_path: str) -> bool:
+    """Heuristically determine if downloaded file is an HTML error page instead of the expected binary archive."""
+    try:
+        with open(file_path, 'rb') as f:
+            start = f.read(512).lower()
+        if not start:
+            return True
+        # Typical HTML markers
+        if start.startswith(b'<!doctype html') or start.startswith(b'<html'):
+            return True
+        # Cloudflare / HuggingFace / gateway error strings
+        if b'<title>' in start and b'error' in start:
+            return True
+        return False
+    except Exception:
+        return True
+
+
 def download_file(url: str, output_path: str, desc: str = "Downloading"):
-    """Download a file from URL with progress bar."""
-    print(f"Downloading from {url}...")
+    """Download a file from URL with progress bar and basic validation.
+
+    If the resulting file appears to be HTML (common when a host returns an error page
+    or a login/ratelimit notice), raise a helpful error early instead of failing later
+    during extraction with a confusing gzip/zip error.
+    """
+    print(f"Downloading from {url} -> {output_path}")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     urlretrieve(url, output_path, DownloadProgressBar(desc))
-    print(f"Downloaded to {output_path}")
+    size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    if _looks_like_html(output_path):
+        with open(output_path, 'rb') as f:
+            snippet = f.read(300).decode(errors='ignore')
+        raise RuntimeError(
+            "Downloaded file appears to be HTML, not an archive. This usually means the host "
+            "returned an error or you hit a rate limit. URL: " + url + "\nFirst bytes:\n" + snippet
+        )
+    if size < 1024:  # Highly unlikely for valid dataset archive
+        raise RuntimeError(f"Downloaded file too small ({size} bytes) – download likely failed: {url}")
+    print(f"Downloaded {size/1_048_576:.2f} MB to {output_path}")
 
 
 def extract_archive(archive_path: str, output_dir: str):
-    """Extract archive (zip, rar, tar, tar.gz, tgz) to output directory."""
-    print(f"Extracting {archive_path}...")
+    """Extract archive (zip, rar, tar/tar.gz/tgz) to output directory with magic-byte detection.
 
-    # Normalize extension handling (check multi-part first)
+    Adds resilience against mis-labelled files and provides clearer diagnostics when the
+    downloaded content is not an archive (e.g. HTML error page).
+    """
+    print(f"Extracting {archive_path} -> {output_dir}")
     lower_name = archive_path.lower()
 
+    if not os.path.isfile(archive_path):
+        raise FileNotFoundError(f"Archive not found: {archive_path}")
+
+    # Quick HTML re-check (in case validation skipped)
+    if _looks_like_html(archive_path):
+        raise RuntimeError(
+            "The file to extract looks like HTML, not an archive. The download likely failed. "
+            f"Path: {archive_path}"
+        )
+
+    # Read magic bytes
+    with open(archive_path, 'rb') as f:
+        magic = f.read(8)
+
+    def try_tar(mode: str = 'r:*'):
+        with tarfile.open(archive_path, mode) as tar:
+            tar.extractall(output_dir)
+
     try:
-        if lower_name.endswith('.zip'):
+        # ZIP: PK\x03\x04
+        if magic.startswith(b'PK') or lower_name.endswith('.zip'):
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
                 zip_ref.extractall(output_dir)
-        elif lower_name.endswith('.rar'):
+        # RAR: Rar!\x1A\x07\x00
+        elif magic.startswith(b'Rar!') or lower_name.endswith('.rar'):
             try:
                 subprocess.run(['unrar', 'x', '-y', archive_path, output_dir], check=True)
             except (subprocess.CalledProcessError, FileNotFoundError):
                 print("ERROR: RAR archive detected but 'unrar' command not found.")
-                print("Please install unrar:")
-                print("  Ubuntu/Debian: sudo apt-get install unrar")
-                print("  macOS: brew install unrar")
-                print("  Windows: Download from https://www.rarlab.com/rar_add.htm")
+                print("Install unrar (e.g. 'sudo apt-get install unrar' or 'brew install unrar').")
                 sys.exit(1)
-        elif lower_name.endswith(('.tar.gz', '.tgz', '.tar')):
-            mode = 'r'
-            if lower_name.endswith('.tar.gz') or lower_name.endswith('.tgz'):
-                mode = 'r:gz'
-            with tarfile.open(archive_path, mode) as tar:
-                tar.extractall(output_dir)
+        # Gzip/Tar: gzip magic 1F 8B; or a tar file (ustar later in file) – tarfile can auto-detect with r:*
+        elif magic.startswith(b'\x1f\x8b') or lower_name.endswith(('.tar.gz', '.tgz', '.tar')) or tarfile.is_tarfile(archive_path):
+            try:
+                try_tar('r:*')  # auto-detect compression
+            except tarfile.ReadError as e:
+                # Provide guidance
+                raise RuntimeError(
+                    f"Failed to read tar archive (auto mode). Original error: {e}\n"
+                    "This may happen if the download returned an HTML error page or was truncated. "
+                    "Try deleting the file and re-running the download, or check your network."
+                ) from e
         else:
-            raise ValueError(f"Unsupported archive format: {archive_path}")
+            raise ValueError(
+                "Unsupported or unrecognized archive format. Magic bytes: " + magic.hex() +
+                f"  File: {archive_path}"
+            )
     except Exception as e:
-        # Provide additional hint if filename still has query parameters
         if '?' in archive_path:
-            print("Hint: The filename contains a '?' which may have prevented extension detection.")
-        raise e
+            print("Hint: The filename previously contained a '?' which may have confused extension detection.")
+        raise
 
-    print(f"Extracted to {output_dir}")
+    print(f"Extraction complete: {output_dir}")
 
 
 def organize_ucf101(source_dir: str, output_dir: str, config: Dict, split_file: Optional[str] = None):
