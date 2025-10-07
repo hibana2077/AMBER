@@ -266,6 +266,32 @@ def collate_fn(examples):
         target_size = 224
 
     B, C, T, H, W = batch.shape
+
+    # ------------------------------------------------------------------
+    # Temporal length enforcement (addresses mismatch e.g. 26 vs expected 8)
+    # We let model.config.num_frames (propagated via AMBER_FORCE_NUM_FRAMES) drive
+    # the target. If provided and different from incoming T, uniformly sample
+    # or duplicate frames to reach target length.
+    # ------------------------------------------------------------------
+    target_frames_env = os.environ.get("AMBER_FORCE_NUM_FRAMES")
+    if target_frames_env:
+        try:
+            target_T = int(target_frames_env)
+        except ValueError:
+            target_T = T
+        if target_T > 0 and T != target_T:
+            import sys
+            # Build uniform indices (works for both shortening and lengthening)
+            if target_T == 1:
+                idx = torch.tensor([T // 2])
+            else:
+                idx = torch.linspace(0, T - 1, target_T).round().long().clamp_(0, T - 1)
+            batch = batch[:, :, idx]
+            _, _, T, _, _ = batch.shape
+            print(
+                f"[collate_fn info] Adjusted temporal length from {T} to {target_T} frames (env target={target_frames_env}).",
+                file=sys.stderr,
+            )
     if (H, W) != (target_size, target_size):
         # Center crop to square first (min side) then resize if needed.
         min_side = min(H, W)
@@ -393,6 +419,13 @@ def do_train(args: argparse.Namespace):
         id2label=id2label,
         ignore_mismatched_sizes=True,
     )
+
+    # Propagate expected num_frames to collate_fn via environment variable for enforcement.
+    try:
+        expected_frames = _get_num_frames_from_config(model.config, 16)
+        os.environ.setdefault("AMBER_FORCE_NUM_FRAMES", str(expected_frames))
+    except Exception:
+        pass
 
     train_ds, val_ds, test_ds = build_datasets(args.data_root, processor, model)
     if train_ds is None:
@@ -531,6 +564,13 @@ def do_eval(args: argparse.Namespace):
     except Exception:
         processor = AutoImageProcessor.from_pretrained(model_path)
     model = AutoModelForVideoClassification.from_pretrained(model_path)
+
+    # Ensure temporal enforcement during evaluation as well.
+    try:
+        expected_frames = _get_num_frames_from_config(model.config, 16)
+        os.environ.setdefault("AMBER_FORCE_NUM_FRAMES", str(expected_frames))
+    except Exception:
+        pass
 
     # Ensure label maps align if possible
     if set(model.config.id2label.values()) != set(id2label.values()):
