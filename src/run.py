@@ -348,6 +348,10 @@ def do_train(args: argparse.Namespace):
         "output_dir": args.output_dir,
     }
     # Always safe / common params
+    # Build a map of common TrainingArguments. IMPORTANT: do NOT pass max_steps=None
+    # because some transformers versions perform numeric comparisons on it and
+    # expect an int. We only include max_steps when we intentionally computed
+    # it (i.e. when epochs was not provided by the user and we derived a steps schedule).
     common_map = {
         "remove_unused_columns": False,
         "learning_rate": args.lr,
@@ -356,10 +360,12 @@ def do_train(args: argparse.Namespace):
         "warmup_ratio": 0.1,
         "logging_steps": 10,
         "num_train_epochs": args.epochs if args.epochs is not None else 1,
-        "max_steps": max_steps,
+        # max_steps intentionally excluded if None (added conditionally below)
         "fp16": args.fp16,
         "dataloader_num_workers": args.num_workers,
     }
+    if max_steps is not None:
+        common_map["max_steps"] = max_steps
     for k, v in common_map.items():
         if k in ta_params:
             ta_kwargs[k] = v
