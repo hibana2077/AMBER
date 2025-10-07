@@ -40,7 +40,7 @@ except Exception as e:  # pragma: no cover
         + str(e)
     )
 
-from amber.utils.video_transforms import (
+from src.utils.video_transforms import (
     UniformTemporalSubsampleTransform,
     RandomShortSideScaleTransform,
     ShortSideResizeTransform,
