@@ -31,21 +31,26 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
-    import pytorchvideo.data
-    from pytorchvideo.transforms import (
-        ApplyTransformToKey,
-        Normalize,
-        RandomShortSideScale,
-        RemoveKey,
-        ShortSideScale,
-        UniformTemporalSubsample,
-    )
-    from torchvision.transforms import Compose, Lambda, RandomCrop, RandomHorizontalFlip, Resize
+    import pytorchvideo.data  # We still rely on the dataset class only.
+    import torchvision
+    from torchvision.transforms import RandomCrop as TVRandomCrop, RandomHorizontalFlip as TVRandomHorizontalFlip, Resize as TVResize
 except Exception as e:  # pragma: no cover
     raise SystemExit(
-        "This script requires pytorchvideo and torchvision. Install requirements (see requirements.txt) and try again.\n"
+        "This script requires pytorchvideo (data only) and torchvision. Install requirements (see requirements.txt) and try again.\n"
         + str(e)
     )
+
+from amber.utils.video_transforms import (
+    UniformTemporalSubsampleTransform,
+    RandomShortSideScaleTransform,
+    ShortSideResizeTransform,
+    RandomCropVideoTransform,
+    CenterCropVideoTransform,
+    RandomHorizontalFlipVideoTransform,
+    NormalizeVideoTransform,
+    ComposeVideo,
+    apply_to_key,
+)
 
 from transformers import (
     AutoModelForVideoClassification,
@@ -101,14 +106,14 @@ def _get_num_frames_from_config(cfg: Any, default: int = 16) -> int:
 
 
 def build_transforms(processor: Any, model: Any):
-    # Processor could be AutoImageProcessor/AutoVideoProcessor specific instance
+    # Derive normalization + size from processor (if available)
     mean = getattr(processor, "image_mean", [0.485, 0.456, 0.406])
     std = getattr(processor, "image_std", [0.229, 0.224, 0.225])
 
     size = getattr(processor, "size", {}) or {}
     if isinstance(size, int):
         height = width = size
-    elif "shortest_edge" in size:
+    elif "shortest_edge" in size:  # some processors expose shortest_edge
         height = width = size["shortest_edge"]
     else:
         height = size.get("height", 224)
@@ -120,39 +125,31 @@ def build_transforms(processor: Any, model: Any):
     fps = 30
     clip_duration = num_frames_to_sample * sample_rate / fps
 
-    train_transform = Compose(
+    # Compose sequence for video tensor (C,T,H,W)
+    train_video_pipeline = ComposeVideo(
         [
-            ApplyTransformToKey(
-                key="video",
-                transform=Compose(
-                    [
-                        UniformTemporalSubsample(num_frames_to_sample),
-                        Lambda(lambda x: x / 255.0),
-                        Normalize(mean, std),
-                        RandomShortSideScale(min_size=256, max_size=320),
-                        RandomCrop(resize_to),
-                        RandomHorizontalFlip(p=0.5),
-                    ]
-                ),
-            ),
+            UniformTemporalSubsampleTransform(num_frames_to_sample),
+            lambda v: v / 255.0,
+            RandomShortSideScaleTransform(256, 320),
+            RandomCropVideoTransform(resize_to),
+            RandomHorizontalFlipVideoTransform(0.5),
+            NormalizeVideoTransform(mean, std),
         ]
     )
 
-    eval_transform = Compose(
+    eval_video_pipeline = ComposeVideo(
         [
-            ApplyTransformToKey(
-                key="video",
-                transform=Compose(
-                    [
-                        UniformTemporalSubsample(num_frames_to_sample),
-                        Lambda(lambda x: x / 255.0),
-                        Normalize(mean, std),
-                        Resize(resize_to),
-                    ]
-                ),
-            ),
+            UniformTemporalSubsampleTransform(num_frames_to_sample),
+            lambda v: v / 255.0,
+            ShortSideResizeTransform(min(resize_to)),  # ensure shortest side matches target before center crop
+            CenterCropVideoTransform(resize_to),
+            NormalizeVideoTransform(mean, std),
         ]
     )
+
+    # Wrap to act on sample dict under key 'video'
+    train_transform = apply_to_key("video", train_video_pipeline)
+    eval_transform = apply_to_key("video", eval_video_pipeline)
 
     return train_transform, eval_transform, clip_duration
 
@@ -168,21 +165,51 @@ def build_datasets(
         split_path = os.path.join(data_root, split)
         if not os.path.isdir(split_path):
             return None
-        return pytorchvideo.data.Ucf101(
+        ds = pytorchvideo.data.Ucf101(
             data_path=split_path,
             clip_sampler=pytorchvideo.data.make_clip_sampler(
                 "random" if split == "train" else "uniform", clip_duration
             ),
             decode_audio=False,
-            transform=transform,
+            transform=None,  # we'll wrap via custom __getitem__ below if needed
         )
+        # If transform is provided, monkey-patch __getitem__ to apply it
+        if transform is not None:
+            base_get = ds.__getitem__
+
+            def _get(i):
+                sample = base_get(i)
+                # pytorchvideo returns dict with 'video' (T,C,H,W); convert to (C,T,H,W) for our pipeline
+                if isinstance(sample, dict) and 'video' in sample:
+                    v = sample['video']  # (T,C,H,W)
+                    if torch.is_tensor(v) and v.dim() == 4:
+                        sample['video'] = v.permute(1,0,2,3)  # -> (C,T,H,W)
+                    sample = transform(sample)
+                    # convert back to (T,C,H,W) for consistency with downstream expectation
+                    v2 = sample['video']
+                    if torch.is_tensor(v2) and v2.shape[0] in (1,3):
+                        sample['video'] = v2.permute(1,0,2,3)
+                return sample
+
+            ds.__getitem__ = _get  # type: ignore
+        return ds
 
     return make("train", train_t), make("val", eval_t), make("test", eval_t)
 
 
 def collate_fn(examples):
-    # permute to (num_frames, num_channels, height, width)
-    pixel_values = torch.stack([example["video"].permute(1, 0, 2, 3) for example in examples])
+    # After our pipeline final shape stored as (T,C,H,W); convert to (C,T,H,W) then to HF expected (B, num_frames, C, H, W)
+    processed = []
+    for ex in examples:
+        v = ex["video"]  # (T,C,H,W)
+        if v.dim() != 4:
+            raise ValueError(f"Unexpected video tensor shape {v.shape}")
+        # Convert to (C,T,H,W) then rearrange for stack later
+        v_cthw = v.permute(1,0,2,3)
+        processed.append(v_cthw)
+    pixel_values = torch.stack(processed)  # (B,C,T,H,W)
+    # HF Video classification models expect pixel_values: (B, num_frames, C, H, W)
+    pixel_values = pixel_values.permute(0,2,1,3,4)
     labels = torch.tensor([int(example["label"]) for example in examples])
     return {"pixel_values": pixel_values, "labels": labels}
 
