@@ -331,24 +331,66 @@ def do_train(args: argparse.Namespace):
         steps_per_epoch = max(1, train_videos // max(1, args.batch_size))
         max_steps = steps_per_epoch * 4  # 4 epochs default
 
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        remove_unused_columns=False,
-        evaluation_strategy="epoch" if val_ds is not None else "no",
-        save_strategy="epoch" if val_ds is not None else "no",
-        learning_rate=args.lr,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        warmup_ratio=0.1,
-        logging_steps=10,
-        load_best_model_at_end=bool(val_ds is not None),
-        metric_for_best_model="accuracy",
-        num_train_epochs=args.epochs if args.epochs is not None else 1,
-        max_steps=max_steps,
-        fp16=args.fp16,
-        dataloader_num_workers=args.num_workers,
-        report_to=["none"],
-    )
+    # ------------------------------------------------------------------
+    # TrainingArguments compatibility across transformers versions.
+    # Older versions (<3.x) lacked evaluation_strategy/save_strategy/etc.
+    # We introspect the __init__ signature to only pass supported params.
+    # ------------------------------------------------------------------
+    import inspect
+
+    ta_sig = inspect.signature(TrainingArguments.__init__)
+    ta_params = set(ta_sig.parameters.keys())
+
+    eval_strategy = "epoch" if val_ds is not None else ("no" if "evaluation_strategy" in ta_params else None)
+    save_strategy = "epoch" if val_ds is not None else ("no" if "save_strategy" in ta_params else None)
+
+    ta_kwargs = {
+        "output_dir": args.output_dir,
+    }
+    # Always safe / common params
+    common_map = {
+        "remove_unused_columns": False,
+        "learning_rate": args.lr,
+        "per_device_train_batch_size": args.batch_size,
+        "per_device_eval_batch_size": args.batch_size,
+        "warmup_ratio": 0.1,
+        "logging_steps": 10,
+        "num_train_epochs": args.epochs if args.epochs is not None else 1,
+        "max_steps": max_steps,
+        "fp16": args.fp16,
+        "dataloader_num_workers": args.num_workers,
+    }
+    for k, v in common_map.items():
+        if k in ta_params:
+            ta_kwargs[k] = v
+
+    # Conditional / version-specific
+    if "evaluation_strategy" in ta_params and eval_strategy is not None:
+        ta_kwargs["evaluation_strategy"] = eval_strategy
+    elif "eval_strategy" in ta_params and eval_strategy is not None:  # newer alias just in case
+        ta_kwargs["eval_strategy"] = eval_strategy
+    elif "evaluate_during_training" in ta_params and val_ds is not None:
+        ta_kwargs["evaluate_during_training"] = True
+
+    if "save_strategy" in ta_params and save_strategy is not None:
+        ta_kwargs["save_strategy"] = save_strategy
+    elif "save_steps" in ta_params and val_ds is not None:
+        # fallback: save every epoch approximation -> set to large steps if dataset length known.
+        if hasattr(train_ds, "__len__"):
+            try:
+                steps_per_epoch = max(1, len(train_ds) // max(1, args.batch_size))
+                ta_kwargs["save_steps"] = steps_per_epoch
+            except Exception:
+                pass
+
+    if "load_best_model_at_end" in ta_params:
+        ta_kwargs["load_best_model_at_end"] = bool(val_ds is not None)
+    if "metric_for_best_model" in ta_params:
+        ta_kwargs["metric_for_best_model"] = "accuracy"
+    if "report_to" in ta_params:
+        ta_kwargs["report_to"] = ["none"]
+
+    training_args = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
         model,
@@ -402,12 +444,17 @@ def do_eval(args: argparse.Namespace):
 
     metric_fn = build_metrics()
 
-    training_args = TrainingArguments(
-        output_dir=os.path.join(args.output_dir, "eval"),
-        per_device_eval_batch_size=args.batch_size,
-        dataloader_num_workers=args.num_workers,
-        report_to=["none"],
-    )
+    import inspect
+    ta_sig = inspect.signature(TrainingArguments.__init__)
+    ta_params = set(ta_sig.parameters.keys())
+    ta_kwargs = {"output_dir": os.path.join(args.output_dir, "eval")}
+    if "per_device_eval_batch_size" in ta_params:
+        ta_kwargs["per_device_eval_batch_size"] = args.batch_size
+    if "dataloader_num_workers" in ta_params:
+        ta_kwargs["dataloader_num_workers"] = args.num_workers
+    if "report_to" in ta_params:
+        ta_kwargs["report_to"] = ["none"]
+    training_args = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
         model,
