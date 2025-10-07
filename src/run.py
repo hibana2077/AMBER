@@ -179,16 +179,18 @@ def build_datasets(
 
             def _get(i):
                 sample = base_get(i)
-                # pytorchvideo returns dict with 'video' (T,C,H,W); convert to (C,T,H,W) for our pipeline
+                # pytorchvideo's Ucf101 returns video shaped (C,T,H,W). We keep that ordering
+                # throughout the transform pipeline (all custom transforms expect (C,T,H,W)).
+                # Older comment assumed (T,C,H,W) which caused an unnecessary permute leading to
+                # temporal dimension misalignment and variable frame counts in a batch.
                 if isinstance(sample, dict) and 'video' in sample:
-                    v = sample['video']  # (T,C,H,W)
+                    v = sample['video']
                     if torch.is_tensor(v) and v.dim() == 4:
-                        sample['video'] = v.permute(1,0,2,3)  # -> (C,T,H,W)
+                        # If a future version returned (T,C,H,W), detect and correct it once.
+                        if v.shape[0] not in (1,3) and v.shape[1] in (1,3):  # (T,C,H,W) heuristic
+                            v = v.permute(1,0,2,3)  # -> (C,T,H,W)
+                        sample['video'] = v
                     sample = transform(sample)
-                    # convert back to (T,C,H,W) for consistency with downstream expectation
-                    v2 = sample['video']
-                    if torch.is_tensor(v2) and v2.shape[0] in (1,3):
-                        sample['video'] = v2.permute(1,0,2,3)
                 return sample
 
             ds.__getitem__ = _get  # type: ignore
@@ -198,19 +200,36 @@ def build_datasets(
 
 
 def collate_fn(examples):
-    # After our pipeline final shape stored as (T,C,H,W); convert to (C,T,H,W) then to HF expected (B, num_frames, C, H, W)
-    processed = []
+    """Collate a list of samples into a batch.
+
+    Accepts samples whose video tensors are either (C,T,H,W) (preferred) or (T,C,H,W).
+    Produces pixel_values shaped (B, T, C, H, W) as expected by HF video models.
+    Ensures a consistent temporal dimension by relying on prior UniformTemporalSubsampleTransform.
+    Raises a clear error if temporal dims still mismatch to aid debugging.
+    """
+    vids = []
     for ex in examples:
-        v = ex["video"]  # (T,C,H,W)
+        v = ex["video"]
         if v.dim() != 4:
-            raise ValueError(f"Unexpected video tensor shape {v.shape}")
-        # Convert to (C,T,H,W) then rearrange for stack later
-        v_cthw = v.permute(1,0,2,3)
-        processed.append(v_cthw)
-    pixel_values = torch.stack(processed)  # (B,C,T,H,W)
-    # HF Video classification models expect pixel_values: (B, num_frames, C, H, W)
-    pixel_values = pixel_values.permute(0,2,1,3,4)
-    labels = torch.tensor([int(example["label"]) for example in examples])
+            raise ValueError(f"Unexpected video tensor rank: {v.shape}")
+        # Detect ordering.
+        if v.shape[0] in (1,3) and v.shape[1] not in (1,3):  # (C,T,H,W)
+            c_thw = v
+        elif v.shape[1] in (1,3) and v.shape[0] not in (1,3):  # (T,C,H,W)
+            c_thw = v.permute(1,0,2,3)
+        else:
+            # Ambiguous; default assume first dim is channels.
+            c_thw = v
+        vids.append(c_thw)
+
+    # Verify uniform temporal length (after subsample transform they should match)
+    t_lens = {v.shape[1] for v in vids}
+    if len(t_lens) != 1:
+        raise RuntimeError(f"Inconsistent num frames in batch after transforms: {sorted(t_lens)}")
+
+    batch = torch.stack(vids)  # (B,C,T,H,W)
+    pixel_values = batch.permute(0,2,1,3,4)  # -> (B,T,C,H,W)
+    labels = torch.tensor([int(ex["label"]) for ex in examples])
     return {"pixel_values": pixel_values, "labels": labels}
 
 
