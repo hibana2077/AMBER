@@ -499,6 +499,10 @@ def do_train(args: argparse.Namespace):
         if k in ta_params:
             ta_kwargs[k] = v
 
+    # Optionally disable tqdm progress bars if user requested and transformers version supports it
+    if getattr(args, "no_tqdm", False) and "disable_tqdm" in ta_params:
+        ta_kwargs["disable_tqdm"] = True
+
     # Conditional / version-specific
     if "evaluation_strategy" in ta_params and eval_strategy is not None:
         ta_kwargs["evaluation_strategy"] = eval_strategy
@@ -596,6 +600,8 @@ def do_eval(args: argparse.Namespace):
         ta_kwargs["dataloader_num_workers"] = args.num_workers
     if "report_to" in ta_params:
         ta_kwargs["report_to"] = ["none"]
+    if getattr(args, "no_tqdm", False) and "disable_tqdm" in ta_params:
+        ta_kwargs["disable_tqdm"] = True
     training_args = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
@@ -628,6 +634,7 @@ def parse_args() -> argparse.Namespace:
     p_train.add_argument("--num-workers", type=int, default=4)
     p_train.add_argument("--fp16", action="store_true")
     p_train.add_argument("--eval-test", action="store_true", help="Also evaluate on test split after training")
+    p_train.add_argument("--no_tqdm", action="store_true", help="Disable tqdm progress bars if supported by transformers version")
 
     # Eval
     p_eval = sub.add_parser("eval", help="Evaluate a fine-tuned model on val/test")
@@ -643,6 +650,7 @@ def parse_args() -> argparse.Namespace:
     p_eval.add_argument("--batch-size", type=int, default=4)
     p_eval.add_argument("--num-workers", type=int, default=4)
     p_eval.add_argument("--output-dir", type=str, default="runs/videomae-ucf")
+    p_eval.add_argument("--no_tqdm", action="store_true", help="Disable tqdm progress bars if supported by transformers version")
 
     return parser.parse_args()
 
