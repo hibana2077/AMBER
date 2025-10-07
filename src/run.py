@@ -320,16 +320,31 @@ def do_train(args: argparse.Namespace):
 
     metric_fn = build_metrics()
 
-    # Some datasets from pytorchvideo don't implement __len__, set max_steps accordingly
+    # Determine if dataset exposes a length; if not, we MUST provide max_steps to Trainer.
     max_steps = None
-    if args.epochs is None:
-        # Use steps if epochs not set: assume 300 videos by default like docs example
-        if hasattr(train_ds, "num_videos") and train_ds.num_videos:
-            train_videos = train_ds.num_videos
+    has_len = True
+    try:  # Some pytorchvideo datasets do not implement __len__
+        _ = len(train_ds)  # noqa: F841
+    except Exception:  # pragma: no cover - environment dependent
+        has_len = False
+
+    if not has_len:
+        # Derive number of training videos, fallback to heuristic if unavailable.
+        if getattr(train_ds, "num_videos", None):
+            train_videos = int(train_ds.num_videos)
         else:
-            train_videos = 300  # heuristic fallback
+            train_videos = 300  # heuristic similar to earlier default
         steps_per_epoch = max(1, train_videos // max(1, args.batch_size))
-        max_steps = steps_per_epoch * 4  # 4 epochs default
+        target_epochs = args.epochs if args.epochs is not None else 4
+        max_steps = steps_per_epoch * target_epochs
+    elif args.epochs is None:
+        # User omitted epochs; still create a reasonable schedule based on heuristic
+        if getattr(train_ds, "num_videos", None):
+            train_videos = int(train_ds.num_videos)
+        else:
+            train_videos = 300
+        steps_per_epoch = max(1, train_videos // max(1, args.batch_size))
+        max_steps = steps_per_epoch * 4  # default to 4 epochs worth of steps
 
     # ------------------------------------------------------------------
     # TrainingArguments compatibility across transformers versions.
@@ -359,7 +374,8 @@ def do_train(args: argparse.Namespace):
         "per_device_eval_batch_size": args.batch_size,
         "warmup_ratio": 0.1,
         "logging_steps": 10,
-        "num_train_epochs": args.epochs if args.epochs is not None else 1,
+        # If dataset lacks __len__, Trainer will rely purely on max_steps; keep epochs minimal (1) to avoid confusion.
+        "num_train_epochs": args.epochs if (args.epochs is not None and max_steps is None) else (args.epochs if args.epochs is not None else 1),
         # max_steps intentionally excluded if None (added conditionally below)
         "fp16": args.fp16,
         "dataloader_num_workers": args.num_workers,
