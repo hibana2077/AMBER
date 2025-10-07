@@ -5,6 +5,7 @@ pytorchvideo
 evaluate
 torchvision
 opencv-python
+sklearn
 pillow
 imageio
 imageio-ffmpeg
