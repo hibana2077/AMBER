@@ -14,9 +14,11 @@ import shutil
 import subprocess
 import sys
 import zipfile
+import tarfile
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.request import urlretrieve
+from urllib.parse import urlparse, unquote
 
 try:
     from tqdm import tqdm
@@ -90,26 +92,40 @@ def download_file(url: str, output_path: str, desc: str = "Downloading"):
 
 
 def extract_archive(archive_path: str, output_dir: str):
-    """Extract archive (zip or rar) to output directory."""
+    """Extract archive (zip, rar, tar, tar.gz, tgz) to output directory."""
     print(f"Extracting {archive_path}...")
-    
-    if archive_path.endswith('.zip'):
-        with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-            zip_ref.extractall(output_dir)
-    elif archive_path.endswith('.rar'):
-        # Try to use unrar command
-        try:
-            subprocess.run(['unrar', 'x', '-y', archive_path, output_dir], check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print("ERROR: RAR archive detected but 'unrar' command not found.")
-            print("Please install unrar:")
-            print("  Ubuntu/Debian: sudo apt-get install unrar")
-            print("  macOS: brew install unrar")
-            print("  Windows: Download from https://www.rarlab.com/rar_add.htm")
-            sys.exit(1)
-    else:
-        raise ValueError(f"Unsupported archive format: {archive_path}")
-    
+
+    # Normalize extension handling (check multi-part first)
+    lower_name = archive_path.lower()
+
+    try:
+        if lower_name.endswith('.zip'):
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(output_dir)
+        elif lower_name.endswith('.rar'):
+            try:
+                subprocess.run(['unrar', 'x', '-y', archive_path, output_dir], check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                print("ERROR: RAR archive detected but 'unrar' command not found.")
+                print("Please install unrar:")
+                print("  Ubuntu/Debian: sudo apt-get install unrar")
+                print("  macOS: brew install unrar")
+                print("  Windows: Download from https://www.rarlab.com/rar_add.htm")
+                sys.exit(1)
+        elif lower_name.endswith(('.tar.gz', '.tgz', '.tar')):
+            mode = 'r'
+            if lower_name.endswith('.tar.gz') or lower_name.endswith('.tgz'):
+                mode = 'r:gz'
+            with tarfile.open(archive_path, mode) as tar:
+                tar.extractall(output_dir)
+        else:
+            raise ValueError(f"Unsupported archive format: {archive_path}")
+    except Exception as e:
+        # Provide additional hint if filename still has query parameters
+        if '?' in archive_path:
+            print("Hint: The filename contains a '?' which may have prevented extension detection.")
+        raise e
+
     print(f"Extracted to {output_dir}")
 
 
@@ -272,11 +288,27 @@ def download_dataset(dataset_key: str, output_dir: str, keep_archive: bool = Fal
     temp_dir = output_path / "temp_download"
     temp_dir.mkdir(exist_ok=True)
     
-    archive_name = config["url"].split("/")[-1]
+    # Derive a clean archive file name (strip query parameters)
+    parsed = urlparse(config["url"])
+    archive_name = os.path.basename(unquote(parsed.path))
     archive_path = temp_dir / archive_name
-    
+
+    # If a previously downloaded file kept query params, rename it so extension detection works
+    # e.g., 'UCF101_subset.tar.gz?download=true'
+    for existing in temp_dir.iterdir():
+        if existing.name.startswith(archive_name) and '?' in existing.name and not archive_path.exists():
+            # Rename to clean name
+            print(f"Renaming previously downloaded file {existing.name} -> {archive_name}")
+            existing.rename(archive_path)
+            break
+
     if not archive_path.exists():
-        download_file(config["url"], str(archive_path), f"Downloading {config['name']}")
+        # Download to a temporary path first to avoid partial file with final name
+        tmp_download_path = archive_path.with_suffix(archive_path.suffix + '.part')
+        if tmp_download_path.exists():
+            tmp_download_path.unlink()
+        download_file(config["url"], str(tmp_download_path), f"Downloading {config['name']}")
+        tmp_download_path.rename(archive_path)
     else:
         print(f"Archive already exists: {archive_path}")
     
@@ -288,12 +320,24 @@ def download_dataset(dataset_key: str, output_dir: str, keep_archive: bool = Fal
     # Download splits if needed
     splits_dir = None
     if "splits_url" in config:
-        splits_name = config["splits_url"].split("/")[-1]
+        parsed_splits = urlparse(config["splits_url"])
+        splits_name = os.path.basename(unquote(parsed_splits.path))
         splits_path = temp_dir / splits_name
-        
+
+        # Handle legacy downloaded names with query params
+        for existing in temp_dir.iterdir():
+            if existing.name.startswith(splits_name) and '?' in existing.name and not splits_path.exists():
+                print(f"Renaming previously downloaded splits file {existing.name} -> {splits_name}")
+                existing.rename(splits_path)
+                break
+
         if not splits_path.exists():
-            download_file(config["splits_url"], str(splits_path), "Downloading splits")
-        
+            tmp_splits_path = splits_path.with_suffix(splits_path.suffix + '.part')
+            if tmp_splits_path.exists():
+                tmp_splits_path.unlink()
+            download_file(config["splits_url"], str(tmp_splits_path), "Downloading splits")
+            tmp_splits_path.rename(splits_path)
+
         splits_extract_dir = temp_dir / "splits"
         splits_extract_dir.mkdir(exist_ok=True)
         extract_archive(str(splits_path), str(splits_extract_dir))
