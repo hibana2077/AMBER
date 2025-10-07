@@ -65,6 +65,15 @@ try:
 except Exception:
     evaluate = None
 
+# -----------------------------
+# HF cache path
+# -----------------------------
+cache_path = os.getenv("PWD")[: os.getenv("PWD").rfind("/")] + "/.cache/huggingface"
+print(f"Using Hugging Face cache path: {cache_path}")
+os.environ["HF_HOME"] = cache_path
+os.environ["TRANSFORMERS_CACHE"] = os.path.join(cache_path, "transformers")
+os.environ["HF_DATASETS_CACHE"] = os.path.join(cache_path, "datasets")
+os.environ["HF_EVALUATE_CACHE"] = os.path.join(cache_path, "evaluate")
 
 # -----------------------------
 # Data / transforms
