@@ -75,6 +75,7 @@ os.environ["HF_HUB_CACHE"] = os.path.join(cache_path, "hub")
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(cache_path, "transformers")
 os.environ["HF_DATASETS_CACHE"] = os.path.join(cache_path, "datasets")
 os.environ["HF_METRICS_CACHE"] = os.path.join(cache_path, "metrics")
+os.environ["HF_MODULES_CACHE"] = os.path.join(cache_path, "modules")
 
 # -----------------------------
 # Data / transforms
