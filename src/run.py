@@ -73,7 +73,7 @@ print(f"Using Hugging Face cache path: {cache_path}")
 os.environ["HF_HOME"] = cache_path
 os.environ["TRANSFORMERS_CACHE"] = os.path.join(cache_path, "transformers")
 os.environ["HF_DATASETS_CACHE"] = os.path.join(cache_path, "datasets")
-os.environ["HF_EVALUATE_CACHE"] = os.path.join(cache_path, "evaluate")
+os.environ["HF_METRICS_CACHE"] = os.path.join(cache_path, "metrics")
 
 # -----------------------------
 # Data / transforms
