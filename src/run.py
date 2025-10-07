@@ -31,9 +31,9 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
-    import pytorchvideo.data  # We still rely on the dataset class only.
     import torchvision
     from torchvision.transforms import RandomCrop as TVRandomCrop, RandomHorizontalFlip as TVRandomHorizontalFlip, Resize as TVResize
+    import pytorchvideo.data  # We still rely on the dataset class only.
 except Exception as e:  # pragma: no cover
     raise SystemExit(
         "This script requires pytorchvideo (data only) and torchvision. Install requirements (see requirements.txt) and try again.\n"
