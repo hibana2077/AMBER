@@ -12,3 +12,4 @@ imageio-ffmpeg
 matplotlib
 numpy
 tqdm
+accelerate
