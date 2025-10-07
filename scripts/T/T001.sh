@@ -13,5 +13,5 @@ source /scratch/rp06/sl5952/Mica/.venv/bin/activate
 export HF_HOME="/scratch/rp06/sl5952/AMBER/.cache"
 
 cd ../..
-uv pip list > uv_installed.txt
+uv pip list >> uv_installed.txt
 python3 -m src.run train --data-root "./datasets/ucf101_subset/temp_download/extracted/UCF101_subset" --output-dir "./runs/videomae-ucf" --epochs 4 --batch-size 4 >> T001.log 2>&1
