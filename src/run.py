@@ -250,6 +250,45 @@ def collate_fn(examples):
         vids = new_vids
 
     batch = torch.stack(vids)  # (B,C,T,H,W)
+
+    # ------------------------------------------------------------------
+    # Spatial size enforcement fallback
+    # Upstream transforms SHOULD guarantee (target_size, target_size) frames
+    # (e.g. 224x224 for VideoMAE). If a mismatch slips through (as observed
+    # in user error: 240x320), we correct it here to avoid trainer crash.
+    # This is defensive and logs only when adjustment is actually needed.
+    # ------------------------------------------------------------------
+    import os, sys, math
+    target_size_env = os.environ.get("AMBER_FORCE_IMAGE_SIZE")
+    try:
+        target_size = int(target_size_env) if target_size_env else 224
+    except ValueError:
+        target_size = 224
+
+    B, C, T, H, W = batch.shape
+    if (H, W) != (target_size, target_size):
+        # Center crop to square first (min side) then resize if needed.
+        min_side = min(H, W)
+        if H != W:
+            top = (H - min_side) // 2
+            left = (W - min_side) // 2
+            batch = batch[:, :, :, top: top + min_side, left: left + min_side]
+            _, _, _, Hc, Wc = batch.shape
+            H, W = Hc, Wc
+        if H != target_size:  # need resize (either down or up)
+            # Merge (B,T) for single interpolate call for efficiency
+            bt = B * T
+            merged = batch.permute(0,2,1,3,4).reshape(bt, C, H, W)  # (B*T,C,H,W)
+            merged = torch.nn.functional.interpolate(
+                merged, size=(target_size, target_size), mode="bilinear", align_corners=False
+            )
+            batch = merged.reshape(B, T, C, target_size, target_size).permute(0,2,1,3,4)
+        # Log once
+        print(
+            f"[collate_fn info] Adjusted frame size from {(H,W)} to {(target_size,target_size)} (env target={target_size_env}).",
+            file=sys.stderr,
+        )
+
     pixel_values = batch.permute(0,2,1,3,4)  # -> (B,T,C,H,W)
     labels = torch.tensor([int(ex["label"]) for ex in examples])
     return {"pixel_values": pixel_values, "labels": labels}
