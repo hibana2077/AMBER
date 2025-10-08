@@ -13,4 +13,4 @@ source /scratch/rp06/sl5952/AMBER/.venv/bin/activate
 export HF_HOME="/scratch/rp06/sl5952/AMBER/.cache"
 
 cd ../..
-python3 -m src.run train --data-root "./datasets/ucf101_subset/temp_download/extracted/UCF101_subset" --output-dir "./runs/videomae-ucf" --epochs 50 --batch-size 32 --no_tqdm >> T002.log 2>&1
+python3 -m src.run train --data-root "./datasets/ucf101_subset/temp_download/extracted/UCF101_subset" --output-dir "./runs/videomae-ucf" --epochs 50 --batch-size 8 --no_tqdm >> T002.log 2>&1
