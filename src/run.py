@@ -310,10 +310,10 @@ def collate_fn(examples):
             )
             batch = merged.reshape(B, T, C, target_size, target_size).permute(0,2,1,3,4)
         # Log once
-        print(
-            f"[collate_fn info] Adjusted frame size from {(H,W)} to {(target_size,target_size)} (env target={target_size_env}).",
-            file=sys.stderr,
-        )
+        # print(
+        #     f"[collate_fn info] Adjusted frame size from {(H,W)} to {(target_size,target_size)} (env target={target_size_env}).",
+        #     file=sys.stderr,
+        # )
 
     pixel_values = batch.permute(0,2,1,3,4)  # -> (B,T,C,H,W)
     labels = torch.tensor([int(ex["label"]) for ex in examples])
